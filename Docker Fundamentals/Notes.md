@@ -122,6 +122,7 @@ docker run nodeapp
 ### Pause and resume a container
 
 Pausing freezes the processes without terminating them.
+Container is running but the process inside the container are stopped.
 
 ```bash
 docker pause my-container
@@ -160,3 +161,10 @@ docker rm my-container
 | `LABEL` | Adds image metadata | `LABEL author="Aryen"` |
 | `USER` | Sets the user for commands and the container | `USER node` |
 | `VOLUME` | Defines a mount point | `VOLUME /data` |
+
+Add in Notes ->
+
+rm vs rm -f vs docker rmi vs docker system prune
+docker start bs docker restart command and which to use when
+docker system df
+
