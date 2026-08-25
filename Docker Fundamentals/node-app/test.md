@@ -2,7 +2,7 @@
 
 ## Image
 
-![Node.js container output](image-1.png)
+![alt text](image.png)
 
 ## Commands
 
