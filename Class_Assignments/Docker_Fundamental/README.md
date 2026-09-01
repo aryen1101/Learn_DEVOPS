@@ -181,7 +181,7 @@ docker run -d --name apache-container -p 8080:80 apache-webapp
 
 ### Files
 
-`src/App.jsx`, `src/main.jsx`, `src/index.css`, `index.html`, `package.json`, `vite.config.js`, `Dockerfile`
+`src/App.jsx`, `src/main.jsx`, `index.html`, `package.json`, `vite.config.js`, `Dockerfile`
 
 ### Dockerfile
 
