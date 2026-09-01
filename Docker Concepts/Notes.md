@@ -293,3 +293,27 @@ docker run -d --name web -v /path/on/host:/usr/share/nginx/html nginx
 ```
 
 Changes made on the host are immediately visible inside the container, and changes made in the container are visible on the host.
+
+
+Docker-Compose ->
+Docker Compose is a tool used to define and run multiple Docker containers as one application using a YAML file, usually compose.yaml.
+Instead of running many docker run commands manually, you describe everything in one file.
+
+Docker Swarm
+
+Docker Swarm is Docker's built-in container orchestration system. It allows you to combine multiple Docker hosts (machines) into a cluster and manage containers across them.
+
+Without Swarm:
+
+Docker Host 1 → containers
+Docker Host 2 → containers
+Docker Host 3 → containers
+
+With Swarm:
+
+              Docker Swarm
+                   │
+       ┌───────────┼───────────┐
+       ↓           ↓           ↓
+    Host 1       Host 2       Host 3
+   Manager       Worker       Worker

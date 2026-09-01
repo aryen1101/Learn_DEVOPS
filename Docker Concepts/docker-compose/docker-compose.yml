@@ -1,0 +1,30 @@
+services:
+
+  frontend:
+    image: nginx
+    ports:
+      - "8080:80"
+
+  # frontend1:
+  #   build: ./frontend
+  #   ports:
+  #     - "8080:80"  ---> if we want to build our own imagee from the Dockerfile
+
+  backend:
+    image: nginx
+
+  database:
+    image: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - db_data:/var/lib/mysql
+    networks:
+      - backend_net
+
+volumes:
+  db_data:
+
+networks:
+  frontend_net:
+  backend_net:
