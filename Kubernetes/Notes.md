@@ -2026,3 +2026,11 @@ kubectl completion powershell | Out-String | Invoke-Expression   # PowerShell
 kubectl get pods -w                              # watch live while applying files elsewhere
 watch kubectl get pods                           # Linux/Mac alternative
 ```
+
+
+Config Map ->
+
+It is used to store Non senssitive environment specific data.
+A ConfigMap is used to store configuration data separately from your application/container image.
+
+ConfigMpa stores non specific environment specific data and secret stores secret environment specific data
