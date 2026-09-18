@@ -21,6 +21,7 @@
 17. [Cluster DNS: CoreDNS & FQDN](#17-cluster-dns-coredns--fqdn)
 18. [Troubleshooting](#18-troubleshooting)
 19. [kubectl Command Reference](#19-kubectl-command-reference)
+20. [ConfigMap, Secret & Ingress (Session 12)](#20-configmap-secret--ingress-session-12)
 
 ---
 
@@ -2028,9 +2029,257 @@ watch kubectl get pods                           # Linux/Mac alternative
 ```
 
 
-Config Map ->
 
-It is used to store Non senssitive environment specific data.
-A ConfigMap is used to store configuration data separately from your application/container image.
+---
 
-ConfigMpa stores non specific environment specific data and secret stores secret environment specific data
+## 20. ConfigMap, Secret & Ingress (Session 12)
+
+### 20.1 The Problem These Solve
+
+If you hardcode config (`LOG_LEVEL`, `DB_HOST`, passwords) inside your code or Docker image, you must **rebuild the image every time a value changes**. Dev, staging and prod would each need a different image.
+
+12-Factor rule: **the code/image stays the same in every environment, only the configuration changes.**
+
+Kubernetes gives two objects for this:
+
+| Object | Stores | Example |
+|--------|--------|---------|
+| **ConfigMap** | Non-sensitive, environment-specific data | log level, port, API URL, feature flags |
+| **Secret** | Sensitive, environment-specific data | DB password, API keys, TLS cert/key |
+
+> `kubectl get all` does **not** show ConfigMaps or Secrets. Check them separately:
+> `kubectl get configmaps` (or `kubectl get cm`) and `kubectl get secret`.
+
+---
+
+### 20.2 ConfigMap
+
+**What it is:** plain-text key/value pairs stored outside the image. The app reads them at runtime as env vars or as files.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: yatri-app-config
+data:
+  LOG_LEVEL: "INFO"
+  PORT: "5000"
+  DATABASE_HOST: "postgres-service"
+```
+
+**How a Pod uses it:**
+
+| Method | YAML | Result inside the container |
+|--------|------|-----------------------------|
+| All keys as env vars | `envFrom: - configMapRef: {name: yatri-app-config}` | `LOG_LEVEL=INFO`, `PORT=5000`, ... |
+| One key as env var | `env: - name: LOG_LEVEL valueFrom: configMapKeyRef: {name: ..., key: LOG_LEVEL}` | just `LOG_LEVEL=INFO` |
+| As files | `volumes: - configMap: {name: ...}` + `volumeMounts: mountPath: /etc/config` | one file per key, value is the file content |
+
+**Commands:**
+
+```bash
+kubectl apply -f app-config.yaml
+kubectl create configmap app-config --from-literal=LOG_LEVEL=INFO   # imperative way
+kubectl get configmaps                 # or: kubectl get cm
+kubectl describe configmap yatri-app-config
+kubectl delete configmap yatri-app-config
+```
+
+**Remember:**
+- Only for **non-sensitive** data. Never put passwords or certificates here.
+- Size limit is **1 MiB**.
+- Changing a ConfigMap does **not** restart running Pods. Env vars are read only at container start. Run `kubectl rollout restart deploy/<name>` to pick up new values.
+
+---
+
+### 20.3 Secret
+
+**What it is:** same idea as ConfigMap, but for sensitive data. Values are stored **base64-encoded**.
+
+```bash
+echo -n "secretpassword" | base64            # encode  -> c2VjcmV0cGFzc3dvcmQ=
+echo -n "c2VjcmV0cGFzc3dvcmQ=" | base64 -d   # decode  -> secretpassword
+```
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: yatri-db-secret
+type: Opaque
+data:                                  # values must be base64
+  POSTGRES_USER: eWF0cmlfYWRtaW4=
+  POSTGRES_PASSWORD: c2VjcmV0cGFzc3dvcmQ=
+```
+
+> You can also use `stringData:` with plain-text values and Kubernetes base64-encodes them for you.
+
+**Secret types:**
+
+| Type | Used for |
+|------|----------|
+| `Opaque` | Generic key/value (default) |
+| `kubernetes.io/tls` | TLS certificate + private key (`tls.crt`, `tls.key`) |
+| `kubernetes.io/dockerconfigjson` | Private registry login (`imagePullSecrets`) |
+
+**How a Pod uses it:** exactly like a ConfigMap, just swap the ref name.
+
+- `envFrom: - secretRef: {name: yatri-db-secret}` -> all keys as env vars
+- `env: valueFrom: secretKeyRef: {name: ..., key: POSTGRES_PASSWORD}` -> one key
+- `volumes: - secret: {secretName: ...}` -> mounted as files (used for TLS keys)
+
+**Commands:**
+
+```bash
+kubectl apply -f db-secret.yaml
+kubectl create secret generic db-secret --from-literal=POSTGRES_PASSWORD=secretpassword
+kubectl create secret tls campus-tls-cert --cert=tls.crt --key=tls.key
+kubectl get secret
+kubectl describe secret yatri-db-secret        # values are hidden, shows only "[N bytes]"
+kubectl get secret yatri-db-secret -o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d   # decode to check
+kubectl delete secret yatri-db-secret
+```
+
+**Remember:**
+- **Base64 is encoding, NOT encryption.** Anyone with `kubectl get secret` access can decode it. Real protection comes from **RBAC** and **encryption at rest** in etcd.
+- For production use an external manager: AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager (via External Secrets Operator).
+- **Always use `echo -n`** when encoding. Without `-n` a trailing newline (`\n`) gets encoded too, so the app sends `password\n` and login fails with `password authentication failed`. Hint: correct base64 for short strings usually ends in `==`, the buggy one ends in `Ao=` / `o=`.
+
+**ConfigMap vs Secret:**
+
+| | ConfigMap | Secret |
+|--|-----------|--------|
+| Data | Non-sensitive | Sensitive |
+| Stored as | Plain text | Base64 |
+| Check with | `kubectl get cm` | `kubectl get secret` |
+| `describe` shows values? | Yes | No (masked) |
+| Size limit | 1 MiB | 1 MiB |
+
+---
+
+### 20.4 Ingress
+
+**The problem:** without Ingress every service that needs to be public needs its own `LoadBalancer` Service. On AWS that is one load balancer (about $25/month) **per service**, ugly URLs like `http://3.15.22.100:30080`, no HTTPS, and no central routing.
+
+**The solution:** one **Ingress Controller** (e.g. NGINX) sits behind a **single** LoadBalancer. You write **Ingress rules** in YAML that say which host/path goes to which ClusterIP Service.
+
+```text
+Internet --> 1 LoadBalancer --> NGINX Ingress Controller (Layer 7 reverse proxy)
+                                          |
+                     +--------------------+--------------------+
+                     |                                         |
+              yatri.local/                              yatri.local/api/*
+                     |                                         |
+          Frontend Service (ClusterIP)              Backend Service (ClusterIP)
+```
+
+**Two parts, both required:**
+
+| Part | What it is |
+|------|------------|
+| **Ingress Controller** | The actual pod (reverse proxy) that receives traffic. Must be installed once per cluster. On Minikube: `minikube addons enable ingress`. On EKS: install `ingress-nginx` via Helm. |
+| **Ingress resource** | Just the routing rules in YAML. Does **nothing** on its own without a controller. |
+
+**Ingress vs Ingress Controller:**
+
+| | Ingress | Ingress Controller |
+|--|---------|--------------------|
+| What is it | A Kubernetes **object** (YAML, `kind: Ingress`) | A **running Pod** (NGINX, Traefik, HAProxy, AWS ALB...) |
+| Job | Describes the rules: this host/path goes to that Service | Reads those rules and actually forwards the traffic |
+| Comes with Kubernetes? | Yes, the API is built in | No, you install it yourself (`minikube addons enable ingress`, Helm on EKS) |
+| How many | One per app / team, as many as you need | Usually one per cluster |
+| Exposed to internet? | No, it is just config | Yes, via a single LoadBalancer / NodePort Service |
+| Linked by | `spec.ingressClassName: nginx` | The `IngressClass` name it watches |
+| Check with | `kubectl get ingress` | `kubectl get pods -n ingress-nginx` |
+
+Simple way to remember: **Ingress = the rulebook, Ingress Controller = the traffic cop who reads it.** If you apply an Ingress but no controller is installed, `kubectl get ingress` shows an empty `ADDRESS` and nothing is reachable.
+
+**Routing types:**
+
+- **Path-based:** `/` -> frontend, `/api` -> backend (same host)
+- **Host-based:** `portal.campus.local` -> portal, `api.campus.local` -> api (same IP)
+- **TLS termination:** HTTPS ends at the Ingress. Backends talk plain HTTP inside the cluster.
+
+**Example - path-based routing:**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: yatri-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: nginx            # which controller handles this
+  rules:
+    - host: yatri.local
+      http:
+        paths:
+          - path: /api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: yatri-backend-service
+                port:
+                  number: 80
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: yatri-frontend-service
+                port:
+                  number: 80
+```
+
+**Adding HTTPS (TLS) - 3 steps:**
+
+```bash
+# 1. Make a self-signed cert (for local testing)
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout tls.key -out tls.crt -subj "/CN=campus.local/O=CampusDevOps"
+
+# 2. Store it in a TLS Secret
+kubectl create secret tls campus-tls-cert --cert=tls.crt --key=tls.key
+
+# 3. Reference the secret in the Ingress (see below)
+```
+
+```yaml
+spec:
+  tls:
+    - hosts: [portal.campus.local, api.campus.local]
+      secretName: campus-tls-cert
+  rules: ...
+```
+
+`kubectl get ingress` will now show `PORTS 80, 443`.
+
+**Commands:**
+
+```bash
+minikube addons enable ingress                 # install the controller (Minikube)
+kubectl apply -f ingress-routes.yaml
+kubectl get ingress                            # or: kubectl get ing
+kubectl describe ingress yatri-ingress         # rules + events
+kubectl get pods -n ingress-nginx              # is the controller running?
+
+# test without editing /etc/hosts
+INGRESS_IP=$(kubectl get ingress campus-ingress-tls -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+curl -k --resolve portal.campus.local:443:$INGRESS_IP https://portal.campus.local/
+```
+
+**Remember:**
+- Ingress works at **Layer 7 (HTTP/HTTPS)**. It routes by hostname and URL path.
+- The `host` must match the `Host` header of the request. Locally, add it to `/etc/hosts` or use `curl --resolve`.
+- Backend Services are normally **ClusterIP**. Only the controller needs to be exposed.
+- Extra features (rate limiting, auth, CORS, canary %) are set with **annotations** on the Ingress.
+
+**Service types vs Ingress:**
+
+| | NodePort | LoadBalancer | Ingress |
+|--|----------|--------------|---------|
+| Layer | 4 (TCP) | 4 (TCP) | 7 (HTTP) |
+| Public IPs needed | 1 per node | 1 per Service | 1 for everything |
+| Host / path routing | No | No | Yes |
+| TLS termination | No | No | Yes |
