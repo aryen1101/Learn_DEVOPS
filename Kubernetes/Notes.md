@@ -22,6 +22,8 @@
 18. [Troubleshooting](#18-troubleshooting)
 19. [kubectl Command Reference](#19-kubectl-command-reference)
 20. [ConfigMap, Secret & Ingress (Session 12)](#20-configmap-secret--ingress-session-12)
+21. [Volumes, Persistent Storage, StorageClass, HPA & Probes](#21-volumes-persistent-storage-storageclass-hpa--probes-session-13)
+22. [Helm](#22-helm-session-15)
 
 ---
 
@@ -2283,3 +2285,1169 @@ curl -k --resolve portal.campus.local:443:$INGRESS_IP https://portal.campus.loca
 | Public IPs needed | 1 per node | 1 per Service | 1 for everything |
 | Host / path routing | No | No | Yes |
 | TLS termination | No | No | Yes |
+
+---
+
+## 21. Volumes, Persistent Storage, StorageClass, HPA & Probes (Session 13)
+
+### 21.1 Volumes
+
+**The problem:** data written inside a container belongs to the container's filesystem. If the container is removed, that data can be lost. A **volume** gives the container another place to store data.
+
+```text
+Container
+    │
+    │ writes data
+    ▼
+ Volume
+```
+
+A volume is declared once under `spec.volumes` and then mounted into a container with `volumeMounts`. The two names must match.
+
+#### `emptyDir`
+
+`emptyDir` creates an empty directory when the Pod starts. All containers inside the same Pod can use it.
+
+```text
+Pod
+ │
+ ├── Container
+ │
+ └── emptyDir
+       │
+       └── /data
+```
+
+```yaml
+# emptydir-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: emptydir-demo
+spec:
+  containers:
+    - name: app
+      image: nginx:1.27
+      volumeMounts:
+        - name: app-storage
+          mountPath: /data
+  volumes:
+    - name: app-storage
+      emptyDir: {}
+```
+
+**The important point:**
+- `emptyDir` exists as long as the **Pod** exists.
+- If the Pod is deleted and recreated, the old `emptyDir` data is **gone**.
+
+**Lab: prove that `emptyDir` dies with the Pod**
+
+```bash
+kubectl apply -f emptydir-pod.yaml
+kubectl get pods
+# NAME            READY   STATUS    RESTARTS   AGE
+# emptydir-demo   1/1     Running   0          10s
+
+# write a file inside the volume
+kubectl exec -it emptydir-demo -- bash
+echo "Hello Kubernetes" > /data/message.txt
+cat /data/message.txt          # Hello Kubernetes
+exit
+
+# delete and recreate the Pod
+kubectl delete pod emptydir-demo
+kubectl apply -f emptydir-pod.yaml
+
+# try to read the old file
+kubectl exec emptydir-demo -- cat /data/message.txt
+# cat: /data/message.txt: No such file or directory
+```
+
+The error is expected: the old Pod and its `emptyDir` storage were deleted together.
+
+#### `hostPath`
+
+`hostPath` mounts a directory **from the Kubernetes node** into the Pod.
+
+```yaml
+# hostpath-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hostpath-demo
+spec:
+  containers:
+    - name: app
+      image: nginx:1.27
+      volumeMounts:
+        - name: host-storage
+          mountPath: /data
+  volumes:
+    - name: host-storage
+      hostPath:
+        path: /tmp/hostpath-data
+        type: DirectoryOrCreate     # create the directory on the node if it is missing
+```
+
+`hostPath` is mainly useful for:
+- Learning
+- Local testing
+- Special node-level use cases
+
+It is generally **not** the first choice for persistent application storage in a production cluster. The data lives on one node, so if the Pod is rescheduled to another node it will not see the data.
+
+**Useful commands:**
+
+```bash
+kubectl get pods
+kubectl describe pod emptydir-demo
+kubectl exec -it emptydir-demo -- bash
+kubectl delete pod emptydir-demo
+```
+
+**Key learning:**
+
+```text
+Volume
+   │
+   └── gives storage to containers
+
+emptyDir
+   │
+   ├── temporary storage
+   └── lifetime is linked to the Pod
+```
+
+Reference: https://kubernetes.io/docs/concepts/storage/volumes/
+
+---
+
+### 21.2 Persistent Storage: PV & PVC
+
+**The problem:** suppose our application stores `student-data.txt`, `database-data`, `images` and `logs` inside a Pod. If the Pod is deleted we do **not** want that data to disappear. For this, Kubernetes provides persistent storage.
+
+| Object | Meaning | Who creates it |
+|--------|---------|----------------|
+| **PersistentVolume (PV)** | Storage available in the cluster | Admin (or dynamically, see 21.3) |
+| **PersistentVolumeClaim (PVC)** | A *request* for storage | Developer |
+| **Pod** | Uses the PVC | Developer |
+
+```text
+PV
+ │
+ │ provides storage
+ ▼
+PVC
+ │
+ │ requests storage
+ ▼
+Pod
+```
+
+**The three manifests:**
+
+```yaml
+# pv.yaml  -  storage available in the cluster
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: student-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /tmp/student-data
+```
+
+```yaml
+# pvc.yaml  -  request for storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: student-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Mi
+```
+
+```yaml
+# pod.yaml  -  uses the PVC
+apiVersion: v1
+kind: Pod
+metadata:
+  name: storage-demo
+spec:
+  containers:
+    - name: app
+      image: nginx:1.27
+      volumeMounts:
+        - name: persistent-storage
+          mountPath: /data
+  volumes:
+    - name: persistent-storage
+      persistentVolumeClaim:
+        claimName: student-pvc
+```
+
+The PV offers `1Gi`, the PVC asks for `500Mi` with the same access mode, so the PVC can bind to that PV.
+
+**Lab: prove that data survives a Pod delete**
+
+```bash
+# 1. Create the PV
+kubectl apply -f pv.yaml
+kubectl get pv
+# NAME         CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS
+# student-pv   1Gi        RWO            Retain           Available
+
+# 2. Create the PVC
+kubectl apply -f pvc.yaml
+kubectl get pvc
+# NAME          STATUS   VOLUME
+# student-pvc   Bound    student-pv        <- Bound = connected to a suitable PV
+
+# 3. Create the Pod
+kubectl apply -f pod.yaml
+kubectl get pods
+# NAME            READY   STATUS
+# storage-demo    1/1     Running
+
+# 4. Write a file
+kubectl exec -it storage-demo -- bash
+echo "Kubernetes Storage" > /data/message.txt
+cat /data/message.txt          # Kubernetes Storage
+exit
+
+# 5. Delete and recreate the Pod
+kubectl delete pod storage-demo
+kubectl apply -f pod.yaml
+
+# 6. The file is still there
+kubectl exec storage-demo -- cat /data/message.txt
+# Kubernetes Storage
+```
+
+**Why did the data stay?** Because the Pod was using a chain whose storage has a lifecycle **independent of the individual Pod**:
+
+```text
+Pod
+ │
+ ▼
+PVC
+ │
+ ▼
+PV
+ │
+ ▼
+Storage
+```
+
+**PV status values:** `Available` (not yet claimed) -> `Bound` (claimed by a PVC) -> `Released` (PVC deleted, but data still there when reclaim policy is `Retain`).
+
+**Access modes:**
+
+| Access Mode | Code | Description |
+|-------------|------|-------------|
+| **ReadWriteOnce** | `RWO` | Volume can be mounted read/write by **one node** |
+| **ReadOnlyMany** | `ROX` | Volume can be mounted read-only by **many nodes** |
+| **ReadWriteMany** | `RWX` | Volume can be mounted read/write by **many nodes** |
+| **ReadWriteOncePod** | `RWOP` | Volume can be mounted read/write by **a single Pod** |
+
+**Useful commands:**
+
+```bash
+kubectl get pv
+kubectl get pvc
+kubectl describe pv student-pv
+kubectl describe pvc student-pvc
+kubectl get pods
+kubectl describe pod storage-demo
+```
+
+**Key learning:**
+- **PV** = storage
+- **PVC** = request for storage
+- **Pod** = uses the PVC
+
+Reference: https://kubernetes.io/docs/concepts/storage/persistent-volumes/
+
+---
+
+### 21.3 StorageClass & Dynamic Provisioning
+
+**The problem with manual PV creation:** suppose 100 developers need storage.
+
+```text
+Developer
+    │
+    ▼
+Creates PVC
+    │
+    ▼
+Admin manually creates PV
+```
+
+This becomes hard to manage. Kubernetes provides **StorageClass** to solve it.
+
+**What it is:** a StorageClass describes a *type* of storage that can be **dynamically provisioned**. The PV is created automatically when a PVC needs it.
+
+```text
+PVC
+ │
+ ▼
+StorageClass
+ │
+ ▼
+Provisioner
+ │
+ ▼
+PV
+```
+
+**Check what the cluster has:**
+
+```bash
+kubectl get storageclass            # or: kubectl get sc
+# NAME                 PROVISIONER
+# standard (default)   k8s.io/minikube-hostpath
+
+kubectl describe storageclass standard
+```
+
+`describe` shows the provisioner, reclaim policy, volume binding mode and whether it is the default StorageClass. The exact output differs per Kubernetes environment (Minikube, EKS, GKE, ...).
+
+**Create a dynamic PVC:**
+
+```yaml
+# pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dynamic-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard        # <- the StorageClass to use
+  resources:
+    requests:
+      storage: 500Mi
+```
+
+```bash
+kubectl apply -f pvc.yaml
+
+kubectl get pvc
+# NAME          STATUS   VOLUME
+# dynamic-pvc   Bound    pvc-xxxxxxxx      <- Bound = the PVC received storage
+
+kubectl get pv
+# a PV named pvc-<uuid> now exists that nobody created by hand
+```
+
+**What happened?** We did **not** create a PV. We created only a PVC, the StorageClass's provisioner created the PV for us, and the PVC bound to it. This is called **dynamic provisioning**.
+
+```text
+PVC
+ │
+ ▼
+StorageClass
+ │
+ ▼
+Dynamic provisioning
+ │
+ ▼
+PV
+```
+
+**Default StorageClass:** a cluster can mark one StorageClass as `(default)`. When a PVC does **not** specify `storageClassName`, Kubernetes uses the default StorageClass (depending on cluster configuration).
+
+**Static vs dynamic:**
+
+| | Static (21.2) | Dynamic (21.3) |
+|--|---------------|----------------|
+| Who creates the PV | Admin, by hand | Provisioner, automatically |
+| PVC field | no `storageClassName` needed (binds to a matching PV) | `storageClassName: <class>` (or default) |
+| PV name | whatever you chose (`student-pv`) | generated (`pvc-<uuid>`) |
+| Scales to many developers | No | Yes |
+
+**Useful commands:**
+
+```bash
+kubectl get storageclass
+kubectl describe storageclass standard
+kubectl get pvc
+kubectl get pv
+kubectl describe pvc dynamic-pvc
+```
+
+**Key learning:**
+- **PV**: storage available
+- **PVC**: storage request
+- **StorageClass**: helps create storage dynamically
+
+Reference: https://kubernetes.io/docs/concepts/storage/storage-classes/
+
+---
+
+### 21.4 HPA: Horizontal Pod Autoscaler
+
+**Why we need it:** imagine the app has 1 Pod. Normal traffic is `CPU = 20%`. Suddenly many users arrive and `CPU = 90%`. We need more Pods. Instead of manually running
+
+```bash
+kubectl scale deployment hpa-demo --replicas=5
+```
+
+the **HPA** changes the number of replicas automatically.
+
+**Horizontal scaling = add more Pods.** HPA does **not** make the existing Pod bigger (that would be *vertical* scaling).
+
+```text
+Before:
+  Pod 1
+
+After scaling:
+  Pod 1   Pod 2   Pod 3   Pod 4
+```
+
+**How it works:**
+
+```text
+Application
+     │
+     ▼
+ CPU usage
+     │
+     ▼
+Metrics Server
+     │
+     ▼
+    HPA
+     │
+     ▼
+ Deployment
+     │
+     ▼
+More / fewer Pods
+```
+
+**The three manifests:**
+
+```yaml
+# deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hpa-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hpa-demo
+  template:
+    metadata:
+      labels:
+        app: hpa-demo
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27
+          resources:
+            requests:
+              cpu: 100m          # REQUIRED for HPA - utilization is measured against this
+            limits:
+              cpu: 200m
+          ports:
+            - containerPort: 80
+```
+
+```yaml
+# service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hpa-demo-service
+spec:
+  selector:
+    app: hpa-demo
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP
+```
+
+```yaml
+# hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hpa-demo
+spec:
+  scaleTargetRef:                  # which workload to scale
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hpa-demo
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50   # keep average CPU at 50% of the request
+```
+
+**CPU requests matter.** HPA computes utilization as *usage / request*:
+
+| CPU request | CPU usage | Utilization |
+|-------------|-----------|-------------|
+| `100m` | `50m` | 50% |
+| `100m` | `90m` | 90% -> above the 50% target, HPA scales up |
+
+Without `resources.requests.cpu` the HPA shows `<unknown>` and never scales.
+
+**Important HPA fields:**
+
+| Field | Meaning |
+|-------|---------|
+| `scaleTargetRef` | Which workload should HPA scale (Deployment, StatefulSet, ...) |
+| `minReplicas` | Minimum number of Pods |
+| `maxReplicas` | Maximum number of Pods |
+| `metrics` | What HPA should monitor (CPU here) |
+
+**Metrics Server.** HPA needs metrics. Check whether they are available:
+
+```bash
+kubectl top nodes
+kubectl top pods
+# "Metrics API not available"  ->  Metrics Server is not installed yet
+
+# Minikube
+minikube addons enable metrics-server
+kubectl get pods -n kube-system      # look for metrics-server-xxxxx
+kubectl top pods                     # try again after a minute
+```
+
+**Lab: watch the HPA scale up and down**
+
+```bash
+kubectl apply -f deployment.yaml
+kubectl get deployment
+kubectl get pods
+
+kubectl apply -f service.yaml
+kubectl get svc
+# NAME               TYPE        CLUSTER-IP
+# hpa-demo-service   ClusterIP   ...
+
+kubectl apply -f hpa.yaml
+kubectl get hpa
+# NAME       TARGETS   MINPODS   MAXPODS   REPLICAS
+# hpa-demo   0%/50%    1         5         1
+
+# generate load: an endless loop of requests to the Service
+kubectl run load-generator \
+  --image=busybox:1.36 \
+  --restart=Never \
+  -- /bin/sh -c \
+  "while true; do wget -q -O- http://hpa-demo-service; done"
+
+# watch in two terminals
+kubectl get hpa -w        # TARGETS climbs, REPLICAS grows toward 5
+kubectl get pods -w       # new hpa-demo Pods appear
+
+# stop the load
+kubectl delete pod load-generator
+kubectl get hpa -w        # after some time REPLICAS goes back down toward 1
+```
+
+Scale-down is slower than scale-up on purpose (a stabilization window of about 5 minutes by default) so the replica count does not flap.
+
+**Useful commands:**
+
+```bash
+kubectl top nodes
+kubectl top pods
+kubectl get hpa
+kubectl describe hpa hpa-demo
+kubectl get deployment
+kubectl get pods
+kubectl get pods -w
+```
+
+**Key learning:**
+- **HPA** = automatically changes Pod count
+- **High load** = more Pods
+- **Low load** = fewer Pods
+
+References:
+- https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/
+- https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale-walkthrough/
+- https://kubernetes.io/docs/tasks/debug/debug-cluster/resource-metrics-pipeline/
+
+---
+
+### 21.5 Probes: Liveness, Readiness, Startup
+
+(Concept summary is in section 15.3. This section is the hands-on lab.)
+
+**Why we need probes:** a Pod can be `Running` while the application inside it is broken. Kubernetes needs a way to check the *application*, not just the container process.
+
+```text
+STARTUP
+  └── "Have you started?"
+
+READINESS
+  └── "Can I send users to you?"
+
+LIVENESS
+  └── "Are you still alive?"
+```
+
+| Probe | Main question | What happens when it fails? |
+|-------|---------------|-----------------------------|
+| **Startup** | Has the app started? | Container can be restarted |
+| **Readiness** | Can it receive traffic? | Pod becomes `NotReady`, removed from Service endpoints. **No restart** |
+| **Liveness** | Is it still healthy? | Container can be restarted |
+
+> **The most important thing:** Readiness failure **≠** container restart.
+
+**Probe mechanisms:** `httpGet`, `tcpSocket`, `exec`, `grpc`. The labs use HTTP because it is easiest to understand.
+
+**Probe configuration fields:**
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /
+    port: 80
+  initialDelaySeconds: 5     # how long to wait before the first check
+  periodSeconds: 5           # how often to check
+  timeoutSeconds: 2          # how long to wait for a response
+  failureThreshold: 3        # consecutive failures allowed before the probe counts as failed
+```
+
+#### Liveness lab
+
+```yaml
+# liveness.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: liveness-demo
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.27
+      ports:
+        - containerPort: 80
+      livenessProbe:
+        httpGet:
+          path: /              # change to /wrong-path to break it
+          port: 80
+        initialDelaySeconds: 5
+        periodSeconds: 5
+        timeoutSeconds: 2
+        failureThreshold: 3
+```
+
+```bash
+kubectl apply -f liveness.yaml
+kubectl get pod liveness-demo
+# NAME            READY   STATUS
+# liveness-demo   1/1     Running
+kubectl describe pod liveness-demo      # look for "Liveness:" in the output
+```
+
+**Break it:** change `path: /` to `path: /wrong-path`, apply again, then watch:
+
+```bash
+kubectl get pod liveness-demo -w        # RESTARTS keeps increasing
+kubectl describe pod liveness-demo      # Events: "Liveness probe failed: HTTP probe failed with statuscode: 404"
+```
+
+Three failures in a row (`failureThreshold: 3`, every 5 s) -> the kubelet kills and restarts the container. Nginx returns 404 for `/wrong-path`, so the container is restarted forever.
+
+#### Readiness lab
+
+```yaml
+# readiness.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: readiness-demo
+  labels:
+    app: readiness-demo
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.27
+      ports:
+        - containerPort: 80
+      readinessProbe:
+        httpGet:
+          path: /              # change to /wrong-path to break it
+          port: 80
+        initialDelaySeconds: 5
+        periodSeconds: 5
+```
+
+```bash
+kubectl apply -f readiness.yaml
+kubectl get pod readiness-demo
+# NAME             READY   STATUS
+# readiness-demo   1/1     Running
+
+# put a Service in front of it and look at the endpoints
+kubectl expose pod readiness-demo --name=readiness-service --port=80
+kubectl get endpoints readiness-service      # shows the Pod IP while the Pod is Ready
+```
+
+**Break it:** change the path to `/wrong-path` and apply again:
+
+```bash
+kubectl get pod readiness-demo
+# NAME             READY   STATUS
+# readiness-demo   0/1     Running      <- Running, but NOT ready
+kubectl get endpoints readiness-service      # ENDPOINTS is now <none>
+```
+
+The application is running, but it fails the readiness check. The Pod stays `Running`, it is **not** restarted, and the Service stops sending traffic to it.
+
+```text
+Pod stays running
+        │
+        ▼
+Pod becomes NotReady
+        │
+        ▼
+Service should not send normal traffic to it
+```
+
+#### Startup lab
+
+Useful for applications that take a long time to start (Java, big databases). Without a startup probe, an aggressive liveness probe could restart the app before it has finished booting.
+
+```text
+Java application
+      │
+      ├── starting...
+      ├── starting...
+      ├── starting...
+      ▼
+Application ready
+```
+
+```yaml
+# startup.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: startup-demo
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.27
+      ports:
+        - containerPort: 80
+      startupProbe:
+        httpGet:
+          path: /
+          port: 80
+        failureThreshold: 30     # 30 x 2 s = up to 60 s allowed to start
+        periodSeconds: 2
+      livenessProbe:
+        httpGet:
+          path: /
+          port: 80
+        periodSeconds: 5
+      readinessProbe:
+        httpGet:
+          path: /
+          port: 80
+        periodSeconds: 5
+```
+
+```bash
+kubectl apply -f startup.yaml
+kubectl get pod startup-demo
+kubectl describe pod startup-demo      # shows Startup, Liveness and Readiness config together
+```
+
+While the startup probe is running, liveness and readiness are **disabled**. Once it passes, the other two take over.
+
+#### Debugging probes
+
+```bash
+kubectl describe pod <pod-name>                     # Events show which probe failed and why
+kubectl logs <pod-name>                             # is the app logging errors?
+kubectl exec -it <pod-name> -- sh                   # test the endpoint from inside
+wget -qO- http://localhost:80/
+kubectl get events --sort-by=.lastTimestamp
+```
+
+**Key learning:**
+
+```text
+Startup
+   │
+   ▼
+Application is starting
+
+Readiness
+   │
+   ▼
+Application can/cannot receive traffic
+
+Liveness
+   │
+   ▼
+Application should continue/restart
+```
+
+References:
+- https://kubernetes.io/docs/concepts/workloads/pods/probes/
+- https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
+
+---
+
+### 21.6 Session 13 Cheat Sheet
+
+| Topic | Object | One-line takeaway |
+|-------|--------|-------------------|
+| Volumes | `emptyDir` | Temporary. Lives and dies with the Pod |
+| Volumes | `hostPath` | Node directory. Learning/testing only |
+| Persistent storage | `PersistentVolume` | Storage that exists in the cluster |
+| Persistent storage | `PersistentVolumeClaim` | A request for storage. Pod mounts the PVC, never the PV directly |
+| Dynamic provisioning | `StorageClass` | Provisioner creates the PV automatically when a PVC asks |
+| Autoscaling | `HorizontalPodAutoscaler` | Adds/removes Pods based on metrics. Needs Metrics Server and CPU requests |
+| Health checks | `startupProbe` | Wait for slow starters before the other probes run |
+| Health checks | `readinessProbe` | Failing -> out of Service endpoints, no restart |
+| Health checks | `livenessProbe` | Failing -> container restarted |
+
+```bash
+# storage
+kubectl get pv,pvc,sc
+kubectl describe pvc <name>
+
+# autoscaling
+kubectl top pods
+kubectl get hpa -w
+
+# probes
+kubectl describe pod <name>        # Liveness/Readiness/Startup lines + Events
+```
+
+---
+
+## 22. Helm (Session 15)
+
+### 22.1 What is Helm?
+
+Helm is the **package manager for Kubernetes**. Without Helm you run `kubectl apply -f` for every YAML file, for every environment. To deploy the same app to dev, staging and production you keep three separate sets of YAML and edit all three by hand when one value changes. That leads to copy-paste errors and configuration drift.
+
+With Helm you write **one chart** and pass **different values** for each environment. One command installs the whole application, one command upgrades it, one command rolls it back.
+
+Three words to remember:
+
+| Term | Meaning | Analogy |
+|------|---------|---------|
+| **Chart** | A packaged collection of Kubernetes YAML templates with variables | The recipe |
+| **Release** | A running instance of a chart installed in a cluster | The cooked meal |
+| **Values** | The variables you pass in to customise the chart | The ingredients |
+
+The same chart can be installed many times with different release names and different values.
+
+#### Helm 2 vs Helm 3
+
+- **Helm 2** needed a server component called **Tiller** running inside the cluster with cluster-admin rights. That was a security risk.
+- **Helm 3** has no Tiller. It is client-only, uses your own kubeconfig permissions, and stores release state as Kubernetes Secrets in the release namespace.
+
+#### Installing and first commands
+
+```bash
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+helm list                                   # installed releases (empty on a new cluster)
+```
+
+#### Installing a public chart from a repository
+
+A **repo** is a place where ready-made charts are published (like Docker Hub for images). Add it, refresh the index, search it, install from it.
+
+```bash
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo update
+helm search repo nginx
+helm install my-nginx bitnami/nginx
+kubectl get pods,svc
+helm uninstall my-nginx                     # deletes every resource the release created
+```
+
+---
+
+### 22.2 Helm Charts
+
+A chart is just a **directory with a fixed layout**. Helm reads the metadata, merges the values into the templates, and sends the resulting plain Kubernetes YAML to the API server.
+
+```text
+my-chart/
+  Chart.yaml        <- who is this chart? (name, version)
+  values.yaml       <- what are the defaults?
+  charts/           <- dependency charts (optional)
+  templates/        <- what does it create? YAML with {{ variables }}
+    deployment.yaml
+    service.yaml
+    _helpers.tpl    <- reusable template snippets
+    NOTES.txt       <- message printed after install
+```
+
+`helm create` generates a complete working skeleton (Deployment, Service, ServiceAccount, HPA, Ingress, helpers, NOTES) that you trim down to what you need.
+
+```bash
+helm create demo-chart                      # generate a working chart skeleton
+helm template my-release demo-chart         # render YAML locally, no cluster needed
+helm install demo-release demo-chart        # deploy to the cluster
+helm list                                   # NAME, NAMESPACE, REVISION, STATUS, CHART
+helm uninstall demo-release
+```
+
+`helm template` is the most useful debugging command: it shows exactly what Kubernetes will receive, with every `{{ }}` replaced.
+
+---
+
+### 22.3 Chart.yaml
+
+`Chart.yaml` tells Helm what the chart is and who made it. `helm lint` fails if it is missing or wrong.
+
+| Field | Meaning |
+|-------|---------|
+| `apiVersion: v2` | Required for Helm 3 |
+| `name` | Chart name |
+| `description` | One line about the chart |
+| `type` | `application` (deploys things, the default) or `library` (shared templates only, never installed directly) |
+| `version` | Version of the **chart itself**. Bump it when template or values files change. Semantic Versioning |
+| `appVersion` | Version of the **application** inside, normally the Docker image tag. Informational only |
+| `keywords`, `home`, `maintainers` | Optional metadata |
+
+**version vs appVersion** is the classic interview question: `version` changes when the chart files change, `appVersion` changes when the app being deployed changes. They move independently.
+
+Chart metadata is readable inside templates as `.Chart.Name`, `.Chart.Version` and `.Chart.AppVersion`.
+
+```bash
+helm lint my-app/                           # "1 chart(s) linted, 0 chart(s) failed"
+```
+
+---
+
+### 22.4 values.yaml
+
+`values.yaml` holds the **default configuration** of a chart. Anything hardcoded in a template (replicas, image tag, port) should move here so the template stays flexible and the same chart works in every environment.
+
+Three ways to give values, from lowest to highest priority:
+
+```text
+values.yaml   ->   -f custom-file.yaml   ->   --set key=value
+(defaults)         (environment overrides)     (quick one-off, always wins)
+```
+
+| Method | Use it for |
+|--------|-----------|
+| `values.yaml` | Defaults, committed with the chart |
+| `-f values-prod.yaml` | Per-environment files (dev, staging, prod). Auditable in Git. Preferred in pipelines |
+| `--set replicaCount=3` | Quick experiments and demos. Avoid in production |
+
+```bash
+helm install my-app ./chart                             # defaults from values.yaml
+helm install my-app ./chart -f values-prod.yaml         # environment file
+helm install my-app ./chart --set replicaCount=3        # single override
+helm template my-app ./chart | grep "replicas:"         # confirm what will be used
+helm template my-app ./chart --set replicaCount=3 | grep "replicas:"
+helm get values <release>                               # values a running release was installed with
+```
+
+---
+
+### 22.5 Templates
+
+A template is an ordinary Kubernetes YAML file with **Go template** expressions inside `{{ }}`. At install time Helm replaces every expression with a real value and applies the result.
+
+Built-in objects you use all the time:
+
+| Expression | Comes from |
+|------------|-----------|
+| `{{ .Values.replicaCount }}` | `values.yaml`, `-f` file or `--set` |
+| `{{ .Release.Name }}` | The release name you type at `helm install` |
+| `{{ .Release.Namespace }}` | Namespace the release is installed in |
+| `{{ .Chart.Name }}` / `{{ .Chart.Version }}` | `Chart.yaml` |
+
+Why `.Release.Name` in resource names matters: it lets you install the same chart twice in one namespace (for example `notes-dev` and `notes-test`) without name collisions.
+
+Useful template features:
+
+- **Conditionals**: `{{- if .Values.service.enabled }} ... {{- end }}` drops the whole block when the value is false, so optional resources like Ingress or HPA only get created when asked for.
+- **Pipelines / functions**: `{{ .Values.app.name | quote }}` wraps the value in quotes. Other common ones are `default`, `upper`, `toYaml`, `indent`.
+- **Whitespace control**: `{{-` and `-}}` trim the newline around the tag so the rendered YAML stays clean.
+- **`_helpers.tpl`**: files starting with `_` are not rendered as resources. They hold named snippets you `include` in many templates (labels, full names).
+
+```bash
+helm template my-release template-demo                                      # render
+helm template my-release template-demo --set replicaCount=5 | grep replicas # render with override
+helm install my-release template-demo --dry-run --debug                     # render against the real cluster
+```
+
+---
+
+### 22.6 Install and Upgrade
+
+Every `helm install` or `helm upgrade` creates a new **revision** of the release. Helm keeps the history so you can go back later.
+
+```text
+REVISION 1 = first install
+REVISION 2 = after first upgrade
+REVISION 3 = after second upgrade (or after a rollback)
+```
+
+| Command | Behaviour |
+|---------|-----------|
+| `helm install` | Fails if the release already exists |
+| `helm upgrade` | Fails if the release does not exist |
+| `helm upgrade --install` | Installs if new, upgrades if it exists. The safest choice for CI/CD |
+
+```bash
+helm install web-app ./app-chart
+helm list
+helm upgrade web-app ./app-chart --set replicaCount=3
+helm upgrade --install web-app ./app-chart -f values-prod.yaml
+helm status web-app
+helm get manifest web-app                   # the exact YAML Helm applied
+helm uninstall web-app
+```
+
+Under the hood an upgrade is a normal Kubernetes rolling update of the Deployment. Helm just generates the new YAML and applies the diff.
+
+---
+
+### 22.7 Rollback
+
+If an upgrade breaks the app (a bad image tag, a wrong env var) you do not fix YAML by hand. You return to a working revision with one command.
+
+Key points:
+
+- `helm history <release>` lists every revision with STATUS (`deployed`, `superseded`, `failed`) and a description.
+- `helm rollback <release> <N>` re-applies the configuration of revision N.
+- A rollback **creates a new revision**, it does not delete history. Rolling back from 2 to 1 gives you revision 3 with description "Rollback to 1".
+- Helm marks a revision `deployed` as soon as the API server accepts the manifests. A broken pod stuck in `ImagePullBackOff` does not make the revision `failed` by itself. Always check `kubectl get pods` after an upgrade.
+
+#### `--atomic`: automatic rollback
+
+`--atomic` on `helm upgrade` waits for all pods to become ready within `--timeout`. If they do not, Helm rolls back to the previous healthy revision by itself. Use it in pipelines so a bad deploy never stays live.
+
+```bash
+helm upgrade rollback-demo ./app-chart --set image.tag=doesnotexist
+kubectl get pods                            # ImagePullBackOff
+helm history rollback-demo
+helm rollback rollback-demo 1
+helm history rollback-demo                  # revision 3: "Rollback to 1"
+helm upgrade rollback-demo ./app-chart --set image.tag=doesnotexist --atomic --timeout 60s
+```
+
+---
+
+### 22.8 Deploying a Full Application (Guestbook & Notes App)
+
+The end-to-end workflow, the same for any chart you write from scratch:
+
+```text
+1. Chart.yaml       metadata
+2. values.yaml      defaults (plus values-prod.yaml etc.)
+3. templates/       Deployment, Service, ConfigMap with {{ }}
+4. helm lint        syntax check
+5. helm template    preview the rendered YAML
+6. helm install     deploy
+7. helm upgrade     change values / scale / new image
+8. helm history     see revisions
+9. helm rollback    revert if broken
+10. helm uninstall  clean up everything at once
+```
+
+Things the demos showed:
+
+- A ConfigMap named `{{ .Release.Name }}-config` and referenced with `envFrom` in the Deployment keeps config and workload in the same release, so they upgrade and roll back together.
+- Values passed through `| quote` become proper YAML strings, which avoids type errors in ConfigMap data.
+- `helm uninstall` removes the Deployment, Service and ConfigMap in one go because Helm tracks everything the release owns.
+- The dev-to-prod switch was nothing more than `helm upgrade ... -f values-prod.yaml` (1 replica, nginx 1.24 -> 3 replicas, nginx 1.25).
+
+```bash
+helm lint notes-chart
+helm template notes-dev notes-chart
+helm install notes-dev notes-chart
+kubectl get pods,svc,configmaps
+helm upgrade notes-dev notes-chart -f notes-chart/values-prod.yaml
+helm history notes-dev
+helm upgrade notes-dev notes-chart --set image.tag=broken-tag-does-not-exist   # simulate bad deploy
+helm rollback notes-dev 2
+helm uninstall notes-dev
+```
+
+---
+
+### 22.9 Troubleshooting Helm
+
+| Symptom | Check | Fix |
+|---------|-------|-----|
+| `helm lint` errors | Message names the file and field | Fix `Chart.yaml` / template syntax |
+| Rendered YAML looks wrong | `helm template` or `--dry-run --debug` | Fix the template or the value path |
+| `release already exists` | `helm list -A` | Use `helm upgrade` or `helm upgrade --install` |
+| Pods `ImagePullBackOff` after upgrade | `kubectl describe pod` Events | `helm rollback <release> <N>` |
+| Release stuck in `pending-upgrade` | `kubectl get secrets -l owner=helm` | Delete the stuck pending revision secret, then `helm rollback` to the last healthy revision |
+| Do not know what values a release has | `helm get values <release>` | Re-run upgrade with correct `-f` / `--set` |
+
+```bash
+helm list -A                                # releases in all namespaces
+helm status <release>
+helm get values <release>
+helm get manifest <release>
+helm history <release>
+kubectl get secrets -l owner=helm           # where Helm 3 stores release state
+```
+
+---
+
+### 22.10 Session 15 Cheat Sheet
+
+| Command | What it does |
+|---------|-------------|
+| `helm create <chart>` | Generate a working chart skeleton |
+| `helm lint <chart>` | Check the chart for errors |
+| `helm template <release> <chart>` | Render YAML locally without a cluster |
+| `helm install <release> <chart>` | Deploy a chart as a release |
+| `helm install ... -f values-prod.yaml` | Install with an environment values file |
+| `helm install ... --set key=value` | Install with a single override |
+| `helm list` | Show releases |
+| `helm upgrade <release> <chart>` | Apply new values / templates, creates a new revision |
+| `helm upgrade --install` | Install or upgrade, safe for CI/CD |
+| `helm upgrade ... --atomic --timeout 60s` | Auto rollback if pods are not ready in time |
+| `helm history <release>` | List revisions |
+| `helm rollback <release> <N>` | Return to revision N (creates a new revision) |
+| `helm uninstall <release>` | Delete every resource the release created |
+| `helm repo add / update / search repo` | Work with public chart repositories |
+
+Interview one-liners:
+
+- **What is Helm?** The package manager for Kubernetes. It turns YAML into parameterised charts you can install, upgrade and roll back with one command.
+- **Chart vs Release?** Chart is the recipe, Release is the cooked meal running in the cluster.
+- **values.yaml vs --set?** `values.yaml` is the default in Git, `--set` is a runtime override. Pipelines should use `-f values-<env>.yaml` so everything is auditable.
+- **What does --atomic do?** Rolls the upgrade back automatically if pods fail readiness within the timeout.
+- **version vs appVersion?** Chart version vs the version of the app inside (image tag).
+
+References:
+- https://helm.sh/docs/
+- https://helm.sh/docs/chart_template_guide/
+- https://helm.sh/docs/helm/
