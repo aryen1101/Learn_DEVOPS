@@ -1,8 +1,4 @@
-# Session 15: Helm
-
-Helm is the package manager for Kubernetes. A **chart** is the package (templates + values), a **release** is one installed copy of the chart, and **values** are the settings you pass in.
-
----
+## Helm
 
 ## Task 1: Helm Commands
 
@@ -274,8 +270,3 @@ kubectl get services
 ![mini project](images/image-18.png)
 ![mini project](images/image-19.png)
 
-**What was practiced**
-
-* Created a chart from scratch with Chart.yaml, values.yaml and three templates.
-* Used a second values file for production.
-* Installed, upgraded, broke, rolled back and uninstalled the release.

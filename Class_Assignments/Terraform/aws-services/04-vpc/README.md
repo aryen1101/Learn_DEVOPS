@@ -1,19 +1,154 @@
 # 04. VPC - Networking
 
-A VPC (Virtual Private Cloud) is my own private network inside AWS. Everything I launch, like EC2 instances and RDS databases, sits inside a VPC. I decide the IP range, how it is split into subnets, what can reach the internet and what stays hidden. Every account gets a default VPC so things work out of the box, but for real projects I create my own with public subnets for things the internet must reach and private subnets for everything else.
+#### What is VPC?
 
-**CIDR.** CIDR is how the IP range is written. `10.0.0.0/16` means the first 16 bits are fixed and the rest are free, which gives 65,536 addresses. A `/24` gives 256. AWS reserves 5 addresses in every subnet, so a `/24` really has 251 usable. I use the private ranges like `10.0.0.0/8` and pick one that does not overlap with other networks I may connect later.
+A VPC (Virtual Private Cloud) is a private, isolated network inside AWS. Resources such as EC2 instances and RDS databases are launched into a VPC. The owner defines the IP range, divides it into subnets, and controls which parts can reach or be reached from the internet. Every account has a default VPC per region; production workloads normally use a custom VPC.
 
-**Subnets.** A subnet is a slice of the VPC range that lives in one Availability Zone. It cannot stretch across zones. For high availability I create at least two subnets of each type in two zones. A subnet is only called public or private because of where its route table points.
+```text
+                      INTERNET
+                          |
+                   Internet Gateway
+                          |
+   ┌──────────────────  VPC 10.0.0.0/16  ──────────────────┐
+   |                                                        |
+   |  PUBLIC SUBNET 10.0.1.0/24      PRIVATE SUBNET 10.0.2.0/24
+   |  route 0.0.0.0/0 → IGW          route 0.0.0.0/0 → NAT
+   |  ├── Load balancer              ├── Application servers
+   |  ├── Bastion host               └── Database
+   |  └── NAT Gateway  ───────────────────────┘
+   |                                                        |
+   └────────────────────────────────────────────────────────┘
+```
 
-**Route tables.** A route table is the list of rules that says where traffic goes based on its destination. Every subnet is attached to exactly one. The `local` route is always there and lets everything inside the VPC talk to each other. A public route table sends `0.0.0.0/0` to the Internet Gateway, a private one sends it to a NAT Gateway or nowhere.
+**Problem VPC solves.** Without a network design every server would be exposed to the internet. A VPC places public facing components in public subnets and keeps application servers and databases in private subnets that the internet cannot reach.
 
-**Internet Gateway.** The Internet Gateway is the door between the VPC and the internet. There is one per VPC. For a server to be reachable from outside it needs three things: a route to the IGW, a public IP, and a security group that allows the traffic.
+#### CIDR
 
-**NAT Gateway.** A NAT Gateway lets servers in a private subnet reach the internet, for updates or API calls, while nobody on the internet can start a connection to them. It sits in a public subnet with an Elastic IP. It costs per hour and per GB, so small labs often skip it.
+CIDR (Classless Inter-Domain Routing) notation defines an IP range.
 
-**Security Groups.** A security group is a firewall on the instance. It only has Allow rules and it is stateful. Rules can point at other security groups, for example allow port 3306 only from the web servers' group. This is the main way I control traffic between servers.
+```text
+10.0.0.0/16
+         └── first 16 bits fixed, remaining 16 bits available → 65,536 addresses
+```
 
-**Network ACLs.** A Network ACL is a firewall on the subnet. Unlike a security group it has both Allow and Deny rules, it is stateless so both directions need rules, and rules are checked in number order with the first match winning. Most of the time the default NACL is left alone. It is handy for blocking one bad IP from a whole subnet.
+| CIDR | Addresses | Usable in AWS | Typical use |
+| :--- | :--- | :--- | :--- |
+| /16 | 65,536 | 65,531 | Whole VPC |
+| /24 | 256 | 251 | One subnet |
+| /28 | 16 | 11 | Smallest subnet allowed |
 
-**Public vs private subnet.** A public subnet routes `0.0.0.0/0` to the Internet Gateway and its instances get public IPs, so it is where load balancers, bastion hosts and NAT Gateways go. A private subnet routes to a NAT or nothing, its instances have only private IPs, and it is where app servers, databases and caches go. Only things that must be reached from the internet belong in the public subnet.
+AWS reserves 5 addresses in every subnet. A smaller number after the slash means a larger range. Private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) are used, and the range must not overlap with other networks that may be connected later. A VPC's CIDR cannot be changed after creation, only extended.
+
+#### Subnets
+
+A subnet is a portion of the VPC's IP range located in exactly one Availability Zone.
+
+```text
+VPC 10.0.0.0/16
+├── 10.0.1.0/24    AZ-a   public
+├── 10.0.2.0/24    AZ-b   public
+├── 10.0.11.0/24   AZ-a   private
+└── 10.0.12.0/24   AZ-b   private
+```
+
+Creating subnets in at least two Availability Zones keeps the application running if one zone fails. A subnet is public or private only because of the route table attached to it.
+
+#### Route tables
+
+A route table contains rules that decide where network traffic is sent based on its destination. Every subnet is associated with exactly one route table.
+
+```text
+Public route table                  Private route table
+10.0.0.0/16 → local                 10.0.0.0/16 → local
+0.0.0.0/0   → Internet Gateway      0.0.0.0/0   → NAT Gateway
+```
+
+The `local` route exists in every table and allows all resources in the VPC to communicate with each other.
+
+#### Internet Gateway
+
+An Internet Gateway (IGW) connects the VPC to the internet. There is one per VPC, and it scales automatically.
+
+```text
+VPC  ◄────  Internet Gateway  ────►  Internet
+```
+
+For an instance to be reachable from the internet, three conditions must all be met:
+
+```text
+1. Its subnet's route table sends 0.0.0.0/0 to the IGW
+2. It has a public IP or Elastic IP
+3. Its security group allows the inbound port
+```
+
+#### NAT Gateway
+
+A NAT (Network Address Translation) Gateway allows instances in private subnets to reach the internet for updates and external API calls, while preventing the internet from initiating connections to them.
+
+```text
+Private instance ──► NAT Gateway ──► Internet Gateway ──► Internet    allowed (outbound)
+Internet ─────────► NAT Gateway ──X                                    blocked (inbound)
+```
+
+The NAT Gateway is placed in a public subnet with an Elastic IP, and the private route table points `0.0.0.0/0` to it. It is billed per hour and per gigabyte.
+
+> NAT Gateway = one way exit for private subnets.
+
+#### Security Groups
+
+A security group is a stateful firewall at the instance level. It contains Allow rules only, and an allowed inbound request automatically permits the response. Rules can reference other security groups rather than IP addresses:
+
+```text
+database-sg: allow port 3306 from web-server-sg
+```
+
+This is the main mechanism for controlling which tier of an application may talk to which.
+
+#### Network ACLs
+
+A Network ACL (NACL) is a firewall at the subnet level. Every subnet has one; the default allows all traffic.
+
+| | Security Group | Network ACL |
+| :--- | :--- | :--- |
+| Level | Instance | Subnet |
+| Rule types | Allow only | Allow and Deny |
+| Stateful | Yes | No, inbound and outbound rules are separate |
+| Evaluation | All rules considered | Numbered order, first match wins |
+| Default | Deny all inbound | Allow all |
+
+Security groups handle most traffic control. NACLs are useful for blocking a specific IP address from an entire subnet.
+
+#### Public vs private subnet
+
+| | Public subnet | Private subnet |
+| :--- | :--- | :--- |
+| Route for 0.0.0.0/0 | Internet Gateway | NAT Gateway, or none |
+| Instances receive public IP | Yes | No |
+| Reachable from the internet | Yes, if the security group allows | No |
+| Can reach the internet | Yes | Only through a NAT Gateway |
+| Typical resources | Load balancers, bastion hosts, NAT Gateway | Application servers, databases, caches |
+
+Only resources that must be reached directly from the internet belong in a public subnet. Everything else is placed in private subnets behind a load balancer.
+
+#### Summary
+
+| Concept | Meaning |
+| :--- | :--- |
+| VPC | Isolated private network in AWS |
+| CIDR | IP range notation, e.g. 10.0.0.0/16 |
+| Subnet | Slice of the range in one Availability Zone |
+| Route table | Rules for where traffic is sent |
+| Internet Gateway | Connection between the VPC and the internet |
+| NAT Gateway | Outbound only internet access for private subnets |
+| Security Group | Stateful firewall on the instance |
+| Network ACL | Stateless firewall on the subnet |
+
+```text
+VPC              = the building
+Subnet           = a floor
+Route table      = the signboard
+Internet Gateway = the main gate
+NAT Gateway      = exit only door
+Security Group   = guard at each room
+Network ACL      = guard at each floor
+```

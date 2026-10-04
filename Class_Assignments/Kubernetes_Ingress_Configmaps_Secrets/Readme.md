@@ -1,4 +1,4 @@
-# Session 12 — ConfigMap, Secret & Ingress
+#  ConfigMap, Secret & Ingress
 
 ## 1. ConfigMap
 

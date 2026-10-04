@@ -1,4 +1,4 @@
-# Session 13: Kubernetes Storage, HPA & Probes
+# Kubernetes Storage, HPA & Probes
 
 ## Task 1: Kubernetes Volumes
 

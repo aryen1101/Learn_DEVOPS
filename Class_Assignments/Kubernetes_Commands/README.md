@@ -1,8 +1,4 @@
-# Session 14: Kubernetes Troubleshooting
-
-When something breaks, do not guess. Follow the order: get -> describe -> events -> logs -> exec -> test -> fix -> verify.
-
----
+# Kubernetes Troubleshooting
 
 ## Task 1: Kubernetes Commands
 

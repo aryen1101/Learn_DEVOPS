@@ -1,4 +1,4 @@
-# Session 11: Kubernetes Networking & Services
+# Kubernetes Networking & Services
 
 ## Task 1: Kubernetes Services
 
