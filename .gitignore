@@ -8,3 +8,5 @@ Desktop.ini
 
 # Logs produced by practice scripts
 *.log
+argocd.exe
+Monitoring-Observability-Gitops/argocd.exe
