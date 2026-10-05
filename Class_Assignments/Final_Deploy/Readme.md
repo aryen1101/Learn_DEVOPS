@@ -1,4 +1,4 @@
-# Session 21: Running TaskBoard with and without Docker Compose
+# Final Deployment
 
 ## Without Docker Compose (docker run)
 

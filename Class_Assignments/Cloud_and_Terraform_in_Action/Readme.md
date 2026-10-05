@@ -1,4 +1,4 @@
-# Session 19: Cloud & Terraform in Action
+# Cloud & Terraform in Action
 
 End to end AWS network infrastructure built with Terraform. Project folder: `terraform-vpc/`
 
