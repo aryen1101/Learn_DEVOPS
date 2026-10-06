@@ -1,4 +1,4 @@
-## Helm
+# Helm
 
 ## Task 1: Helm Commands
 
